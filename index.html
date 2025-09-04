@@ -383,6 +383,867 @@
     }
 
     // ---------- Auth (email = name@noemail.schnipels.app) ----------
+    
+    function register(){
+      var name=$("#nameInput").value.trim();
+      var dob=$("#dobInput").value;
+      var pass=$("#passInput").value;
+      if(!name || !dob || !pass){ toast("Bitte alle Felder ausfüllen."); return; }
+      if(pass.length < 6){ toast("Passwort: mind. 6 Zeichen (Firebase)."); return; }
+      var email = emailFromName(name);
+
+      // 1) Auth zuerst (dadurch sind Rules mit request.auth != null erfüllt)
+      sha(pass).then(function(ph){
+        return auth.createUserWithEmailAndPassword(email, pass).then(function(cred){
+          authUser = cred.user;
+          var usersRef = db.doc("users/"+name);
+          return usersRef.get().then(function(snap){
+            if(snap.exists){
+              var u = snap.data();
+              if(u.uid && u.uid !== authUser.uid){
+                toast("Name bereits vergeben."); 
+                // sauber aufräumen
+                authUser.delete().catch(function(){});
+                return auth.signOut();
+              } else {
+                currentUser = u; currentUser.name = name;
+                return afterLogin();
+              }
+            } else {
+              var base = {
+                uid: authUser.uid,
+                name: name, dob: dob, passHash: ph, createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+                balance:1500,
+                novaline:{ balance:1500, lastDaily:"", overdraft:-100000 },
+                starline:{ balance:1500, lastWithdraw:"", withdrawnToday:0, overdraft:-200000 },
+                loan:{ outstanding:0, lastBorrow:"", borrowedToday:0 },
+                lastSpin:""
+              };
+              return usersRef.set(base).then(function(){
+                currentUser = base;
+                return afterLogin();
+              });
+            }
+          });
+        });
+      }).catch(function(err){
+        console.error(err);
+        toast("Registrierung fehlgeschlagen: "+(err && err.message ? err.message : err));
+      });
+    }
+
+
+    function login(){
+      var name=$("#nameInput").value.trim();
+      var pass=$("#passInput").value;
+      if(!name || !pass){ toast("Name & Passwort eingeben."); return; }
+      var email = emailFromName(name);
+      auth.signInWithEmailAndPassword(email, pass).then(function(cred){
+        authUser = cred.user;
+        return db.doc("users/"+name).get().then(function(snap){
+          if(!snap.exists){ toast("Nutzer-Daten fehlen."); return; }
+          var doc = snap.data();
+          if(doc.uid !== authUser.uid){ toast("Dieser Name gehört zu einem anderen Account."); return; }
+          currentUser = doc; currentUser.name = name;
+          afterLogin();
+        });
+      }).catch(function(err){ console.error(err); toast("Login fehlgeschlagen: "+(err.message||err)); });
+    }
+
+    function afterLogin(){
+      showApp(); renderGames(); refreshProfileBar();
+      // real-time user updates
+      db.doc("users/"+currentUser.name).onSnapshot(function(s){
+        if(s.exists){ currentUser = s.data(); currentUser.name = s.id; refreshProfileBar(); }
+      });
+      // ensure bank
+      db.doc("system/bank").get().then(function(s){ if(!s.exists){ return db.doc("system/bank").set({ balance: 1000000000, createdAt: firebase.firestore.FieldValue.serverTimestamp() }); } });
+      $("#topGameSelect").innerHTML = games.map(function(g){ return '<option value="'+g.id+'">'+g.name+'</option>'; }).join("");
+    }
+
+    function refreshProfileBar(){
+      $("#profName").textContent = currentUser ? currentUser.name : "–";
+      $("#profBalance").textContent = fmt(currentUser ? currentUser.balance : 0);
+      $("#profLoan").textContent = fmt(currentUser && currentUser.loan ? currentUser.loan.outstanding : 0);
+      $("#balNovaline").textContent = fmt(currentUser && currentUser.novaline ? currentUser.novaline.balance : 0);
+      $("#balStarline").textContent = fmt(currentUser && currentUser.starline ? currentUser.starline.balance : 0);
+    }
+
+    // ---------- Bank ----------
+    function openBank(){ if(!currentUser){ toast("Bitte zuerst anmelden."); return; } refreshBankPanel().then(function(){ $("#bankModal").classList.add("open"); }); }
+    function closeBank(){ try{ $("#bankModal").classList.remove("open"); }catch(e){ console.warn(e); } }
+    function bankLedger(amount, type, meta){
+      meta = meta || {};
+      return db.doc("system/bank").collection("ledger").add({ amount:amount, type:type, meta:meta, ts: firebase.firestore.FieldValue.serverTimestamp() });
+    }
+    function refreshBankPanel(){
+      return db.doc("system/bank").get().then(function(b){
+        var data = b.exists ? b.data() : {balance:0};
+        $("#bankBalance").textContent = fmt(data.balance||0);
+        return db.doc("system/bank").collection("ledger").orderBy("ts","asc").limit(200).get().then(function(qs){
+          var inSum=0,outSum=0,s=0,labels=[],values=[];
+          qs.forEach(function(d){
+            var a=(d.data().amount)||0;
+            if(a>=0) inSum+=a; else outSum+=Math.abs(a);
+            s+=a;
+            var ts = d.data().ts && d.data().ts.toDate ? d.data().ts.toDate() : null;
+            labels.push(ts? ts.toLocaleString("de-DE") : "");
+            values.push(s);
+          });
+          $("#bankIn").textContent = fmt(inSum);
+          $("#bankOut").textContent = fmt(outSum);
+          try{
+            var ctx = document.getElementById("bankChart").getContext("2d");
+            if(bankChart && bankChart.destroy){ bankChart.destroy(); }
+            bankChart = new Chart(ctx, { type:"line", data:{ labels:labels, datasets:[{ label:"Bank Netto", data:values, tension:.25, fill:true }]}, options:{ responsive:true, plugins:{legend:{display:false}}, scales:{x:{display:false}} } });
+          }catch(e){ /* Chart optional */ }
+          $("#loanInfo").textContent = "Offen: "+fmt(currentUser.loan?currentUser.loan.outstanding:0)+" · Heute geliehen: "+fmt(currentUser.loan?currentUser.loan.borrowedToday:0)+" (max 10.000/Tag · max 100.000 gesamt)";
+        });
+      });
+    }
+    function borrow(){
+      if(!currentUser){ toast("Bitte anmelden."); return; }
+      var a = Number($("#loanAmount").value||0); if(a<=0){ toast("Betrag eingeben."); return; }
+      var today=todayKey();
+      var loan=currentUser.loan||{outstanding:0,lastBorrow:"",borrowedToday:0};
+      if(loan.lastBorrow!==today){ loan.borrowedToday=0; loan.lastBorrow=today; }
+      var maxToday = 10000 - (loan.borrowedToday||0);
+      var maxTotal = 100000 - (loan.outstanding||0);
+      var allowed = Math.max(0, Math.min(maxToday, maxTotal));
+      if(a>allowed){ toast("Maximal möglich: "+fmt(allowed)); return; }
+      db.doc("system/bank").get().then(function(s){ 
+        var bankBal = (s.exists && s.data().balance)||0;
+        if(bankBal < a){ toast("Bank hat nicht genug Liquidität."); return; }
+        return db.doc("system/bank").update({ balance: bankBal - a }).then(function(){
+          return bankLedger(-a,"loan",{user: currentUser.name, amount:a});
+        }).then(function(){
+          currentUser.balance = (currentUser.balance||0) + a;
+          currentUser.loan = { outstanding:(loan.outstanding||0)+a, lastBorrow:today, borrowedToday:(loan.borrowedToday||0)+a };
+          return db.doc("users/"+currentUser.name).update({ balance: currentUser.balance, loan: currentUser.loan }).then(function(){
+            toast("Geliehen: "+fmt(a)); refreshProfileBar(); refreshBankPanel();
+          });
+        });
+      });
+    }
+    function repay(){
+      if(!currentUser){ toast("Bitte anmelden."); return; }
+      var outstanding = (currentUser.loan && currentUser.loan.outstanding)||0;
+      if(outstanding<=0){ toast("Keine offenen Leihen."); return; }
+      var minToPay = Math.ceil(outstanding*1.10);
+      if((currentUser.balance||0) < minToPay){ toast("Benötigt mind. "+fmt(minToPay)); return; }
+      db.doc("system/bank").get().then(function(s){
+        var b=(s.exists && s.data().balance)||0;
+        return db.doc("system/bank").update({ balance: b + minToPay }).then(function(){
+          return bankLedger(+minToPay,"repay",{user: currentUser.name});
+        }).then(function(){
+          currentUser.balance -= minToPay; currentUser.loan.outstanding = 0;
+          return db.doc("users/"+currentUser.name).update({ balance: currentUser.balance, loan: currentUser.loan }).then(function(){
+            toast("Zurückgezahlt: "+fmt(minToPay)); refreshProfileBar(); refreshBankPanel();
+          });
+        });
+      });
+    }
+    function deposit(){
+      if(!currentUser){ toast("Bitte anmelden."); return; }
+      var amt = Number($("#txnAmount").value||0); var acc = $("#accountSelect").value;
+      if(amt<=0){ toast("Betrag eingeben."); return; }
+      if((currentUser.balance||0) < amt){ toast("Zu wenig Wallet-Guthaben."); return; }
+      currentUser[acc].balance = (currentUser[acc].balance||0) + amt;
+      currentUser.balance -= amt;
+      var patch = { balance: currentUser.balance }; patch[acc] = currentUser[acc];
+      db.doc("users/"+currentUser.name).update(patch).then(function(){
+        toast("Eingezahlt: "+fmt(amt)+" → "+acc.toUpperCase()); refreshProfileBar(); refreshBankPanel();
+      });
+    }
+    function withdraw(){
+      if(!currentUser){ toast("Bitte anmelden."); return; }
+      var amt = Number($("#txnAmount").value||0); var acc = $("#accountSelect").value;
+      if(amt<=0){ toast("Betrag eingeben."); return; }
+      if(acc==="starline"){
+        var today=todayKey();
+        if(currentUser.starline.lastWithdraw!==today){ currentUser.starline.withdrawnToday=0; currentUser.starline.lastWithdraw=today; }
+        if(currentUser.starline.withdrawnToday + amt > 15000){ toast("STARLINE Tageslimit 15.000 erreicht."); return; }
+        currentUser.starline.withdrawnToday += amt;
+      }
+      if((currentUser[acc].balance||0) - amt < currentUser[acc].overdraft){ toast("Überziehungsgrenze erreicht."); return; }
+      currentUser[acc].balance -= amt; currentUser.balance = (currentUser.balance||0) + amt;
+      var patch = { balance: currentUser.balance }; patch[acc] = currentUser[acc];
+      if(acc==="starline"){ patch["starline"] = currentUser.starline; }
+      db.doc("users/"+currentUser.name).update(patch).then(function(){
+        toast("Abgehoben: "+fmt(amt)+" aus "+acc.toUpperCase()); refreshProfileBar(); refreshBankPanel();
+      });
+    }
+    function claimDaily(){
+      if(!currentUser){ toast("Bitte anmelden."); return; }
+      var today=todayKey();
+      if(currentUser.novaline.lastDaily===today){ toast("Daily schon abgeholt."); return; }
+      currentUser.novaline.lastDaily=today;
+      currentUser.novaline.balance=(currentUser.novaline.balance||0)+500;
+      db.doc("users/"+currentUser.name).update({ novaline: currentUser.novaline }).then(function(){
+        toast("NOVALINE Daily +500 €"); refreshProfileBar(); refreshBankPanel();
+      });
+    }
+
+    // ---------- Daily Spin ----------
+    function openDailySpin(){ drawWheel(); showTab("spin"); }
+    function drawWheel(){
+      var canvas=$("#spinCanvas"); var ctx=canvas.getContext("2d");
+      var prizes=[10,30,50,100,1000,"X","X","X","X"]; var total=prizes.length; var cx=canvas.width/2, cy=canvas.height/2, r=150;
+      ctx.clearRect(0,0,canvas.width,canvas.height);
+      for(var i=0;i<total;i++){
+        var start=i*2*Math.PI/total, end=(i+1)*2*Math.PI/total;
+        ctx.beginPath(); ctx.moveTo(cx,cy); ctx.arc(cx,cy,r,start,end); ctx.closePath();
+        ctx.fillStyle=i%2? "#20204a" : "#2a2a64"; ctx.fill(); ctx.strokeStyle="#3a3a7a"; ctx.stroke();
+        ctx.save(); ctx.translate(cx,cy); ctx.rotate(start+(end-start)/2); ctx.textAlign="center"; ctx.fillStyle="#e8ecff"; ctx.font="bold 16px system-ui";
+        ctx.fillText(String(prizes[i]), r-50, 6); ctx.restore();
+      }
+      ctx.beginPath(); ctx.moveTo(cx,cy-r-8); ctx.lineTo(cx-8,cy-r+12); ctx.lineTo(cx+8,cy-r+12); ctx.closePath(); ctx.fillStyle="#ffd54d"; ctx.fill();
+    }
+    function spinDaily(){
+      if(!currentUser){ toast("Bitte anmelden."); return; }
+      var today=todayKey();
+      if(currentUser.lastSpin===today){ toast("Schon gedreht heute."); return; }
+      var prizes=[10,30,50,100,1000,0,0,0,0];
+      var idx=Math.floor(Math.random()*prizes.length); var win=prizes[idx];
+      $("#spinStatus").textContent="Dreht...";
+      sleep(600).then(function(){
+        currentUser.lastSpin=today; currentUser.balance=(currentUser.balance||0)+win;
+        return db.doc("users/"+currentUser.name).update({ lastSpin: today, balance: currentUser.balance }).then(function(){
+          toast(win>0? "Gewonnen: "+fmt(win) : "Niete – morgen wieder!"); $("#spinStatus").textContent = win>0? ("+"+fmt(win)) : "Niete"; refreshProfileBar();
+        });
+      });
+    }
+
+    // ---------- Games ----------
+    function openGame(id){
+      if(!currentUser){ toast("Bitte zuerst anmelden."); return; }
+      var g=null; for(var i=0;i<games.length;i++){ if(games[i].id===id){ g=games[i]; break; } }
+      if(!g){ return; }
+      $("#gameTitle").textContent = g.name; $("#walletInline").textContent = fmt(currentUser.balance||0);
+      var ui=$("#gameUI"); ui.innerHTML="";
+      var betBox=document.createElement("div"); betBox.className="row";
+      betBox.innerHTML='<input id="betInput" type="number" min="'+g.min+'" max="'+g.max+'" step="10" placeholder="Einsatz (min '+g.min+')"/><button class="btn" id="playBtn">▶ Spielen</button>';
+      ui.appendChild(betBox);
+      var area=document.createElement("div"); area.style.marginTop=".8rem"; ui.appendChild(area);
+      var log=$("#gameLog"); log.innerHTML="";
+      function addLog(m){ var r=document.createElement("div"); r.className="row"; r.textContent=m; log.prepend(r); }
+      function rng(n){ return Math.floor(Math.random()*n); }
+      var symbols=["🍒","🔔","⭐","💎","7️⃣"]; var mul={ "🍒":2, "🔔":3, "⭐":5, "💎":10, "7️⃣":20 };
+      var impl = {
+        slot3: function(bet){ area.innerHTML='<div class="row" style="gap:.6rem;justify-content:center;font-size:2rem"><div id="r1">?</div><div id="r2">?</div><div id="r3">?</div></div>';
+          var r=[symbols[rng(symbols.length)],symbols[rng(symbols.length)],symbols[rng(symbols.length)]];
+          return sleep(200).then(function(){ $("#r1").textContent=r[0]; return sleep(200); }).then(function(){ $("#r2").textContent=r[1]; return sleep(200); }).then(function(){ $("#r3").textContent=r[2];
+            if(r[0]===r[1] && r[1]===r[2]) return bet*mul[r[0]]; if(r[0]===r[1] || r[1]===r[2]) return Math.floor(bet*1.2); return 0;
+          }); },
+        slot5: function(bet){ area.innerHTML='<div class="row" style="gap:.4rem;justify-content:center;font-size:1.6rem" id="row5"></div>';
+          var row=[]; for(var i=0;i<5;i++){ row.push(symbols[rng(symbols.length)]); } $("#row5").innerHTML=row.map(function(x){ return "<span>"+x+"</span>"; }).join("");
+          var counts={}; symbols.forEach(function(s){ counts[s]=row.filter(function(x){ return x===s; }).length; });
+          var best = Object.keys(counts).sort(function(a,b){ return counts[b]-counts[a]; })[0];
+          var count = counts[best]; var m = mul[best]*(count>=4?1.5:1)*(count===5?2:1);
+          return Promise.resolve(count>=3? Math.floor(bet*m):0); },
+        wheel: function(bet){ var segs=[0,0,bet*2, bet*3, 0, bet*5, 0, bet*10, 0, bet*20]; var idx=rng(segs.length);
+          area.innerHTML='<div class="row" style="justify-content:center;font-size:1.2rem">Segment '+(idx+1)+' → '+(segs[idx]===0?"Niete":fmt(segs[idx]))+'</div>'; return Promise.resolve(segs[idx]); },
+        hilo: function(bet){ function card(){ return rng(13)+1; } var a=card(), b=card();
+          area.innerHTML='<div class="row" style="justify-content:center;gap:1rem;font-size:1.4rem"><div>Erste Karte: <strong>'+a+'</strong></div><div>Zweite Karte: <strong>'+b+'</strong></div></div>'; return Promise.resolve(b>a? Math.floor(bet*2):0); },
+        dice: function(bet){ var d1=rng(6)+1, d2=rng(6)+1, s=d1+d2; area.innerHTML='<div class="row" style="justify-content:center;gap:1rem;font-size:1.4rem">🎲 '+d1+' + '+d2+' = <strong>'+s+'</strong></div>'; return Promise.resolve(s>7? Math.floor(bet*2):0); },
+        roulette: function(bet){ var choice=Math.random()<.5?"🟥 Rot":"⬛ Schwarz"; var result=Math.random()<.5?"🟥 Rot":"⬛ Schwarz";
+          area.innerHTML='<div class="row" style="justify-content:center;gap:.6rem;font-size:1.2rem"><span>Dein Tipp: '+choice+'</span><span>Ergebnis: '+result+'</span></div>'; return Promise.resolve(choice===result? Math.floor(bet*2):0); },
+        blackjack: function(bet){ function draw(){ return Math.min(rng(13)+1,10); } var p=draw()+draw(), d=draw()+draw();
+          area.innerHTML='<div class="row" style="justify-content:center;gap:1rem;font-size:1.2rem">Du: '+p+' · Dealer: '+d+'</div>'; if(p>21) return Promise.resolve(0); if(d>21||p>d) return Promise.resolve(Math.floor(bet*2)); if(p===d) return Promise.resolve(bet); return Promise.resolve(0); },
+        coin: function(bet){ var res=Math.random()<.5?"Kopf":"Zahl"; area.innerHTML='<div class="row" style="justify-content:center;font-size:1.4rem">🪙 '+res+'</div>'; return Promise.resolve(Math.random()<.5? Math.floor(bet*2):0); },
+        plinko: function(bet){ var mults=[0,.5,1,2,5,10]; var m=mults[rng(mults.length)]; area.innerHTML='<div class="row" style="justify-content:center;font-size:1.2rem">Multiplikator: ×'+m+'</div>'; return Promise.resolve(Math.floor(bet*m)); },
+        scratch: function(bet){ var pool=[10,20,50,100,500,0,0,0,0]; var a=pool[rng(pool.length)], b=pool[rng(pool.length)], c=pool[rng(pool.length)];
+          area.innerHTML='<div class="row" style="justify-content:center;gap:.6rem"><span class="pill">'+a+'</span><span class="pill">'+b+'</span><span class="pill">'+c+'</span></div>'; return Promise.resolve((a===b&&b===c)? bet+a:0); }
+      };
+
+      document.getElementById("playBtn").onclick=function(){
+        var bet = Number(document.getElementById("betInput").value||0);
+        if(isNaN(bet) || bet<g.min){ toast("Mindesteinsatz "+fmt(g.min)); return; }
+        if(bet>g.max) bet=g.max;
+        if((currentUser.balance||0) < bet){ toast("Zu wenig Guthaben."); return; }
+        // bet -> bank
+        db.doc("system/bank").get().then(function(b){
+          var bankBal = (b.exists && b.data().balance)||0;
+          return db.doc("users/"+currentUser.name).update({ balance: (currentUser.balance||0) - bet }).then(function(){
+            currentUser.balance -= bet; $("#walletInline").textContent=fmt(currentUser.balance||0);
+            return db.doc("system/bank").update({ balance: bankBal + bet }).then(function(){
+              return bankLedger(+bet,"bet-in",{user: currentUser.name, game: g.id, bet:bet});
+            });
+          }).then(function(){
+            return impl[g.type](bet).then(function(payout){
+              return db.doc("system/bank").get().then(function(b2){
+                var bal2 = (b2.exists && b2.data().balance)||0;
+                if(payout>0){
+                  if(bal2 < payout){
+                    // refund bet
+                    return db.doc("users/"+currentUser.name).update({ balance: currentUser.balance + bet }).then(function(){
+                      currentUser.balance += bet; $("#walletInline").textContent=fmt(currentUser.balance||0);
+                      return db.doc("system/bank").update({ balance: bal2 - bet }).then(function(){
+                        return bankLedger(-bet,"payout-out",{user: currentUser.name, game:g.id, note:"Refund wegen Bank-Liquidität"}).then(function(){
+                          toast("Bank-Liquidität zu niedrig – Einsatz zurück."); refreshProfileBar();
+                        });
+                      });
+                    });
+                  }else{
+                    // pay out
+                    return db.doc("users/"+currentUser.name).update({ balance: currentUser.balance + payout }).then(function(){
+                      currentUser.balance += payout; $("#walletInline").textContent=fmt(currentUser.balance||0);
+                      return db.doc("system/bank").update({ balance: bal2 - payout }).then(function(){
+                        return bankLedger(-payout,"payout-out",{user: currentUser.name, game:g.id, win:payout}).then(function(){
+                          return addWinForLeaderboards(currentUser.name, g.id, payout).then(function(){
+                            toast("Gewinn "+fmt(payout)); refreshProfileBar();
+                          });
+                        });
+                      });
+                    });
+                  }
+                }else{
+                  refreshProfileBar();
+                }
+              });
+            });
+          });
+        }).catch(function(err){ console.error(err); toast("Spiel fehlgeschlagen."); });
+      };
+
+      $("#gameModal").classList.add("open");
+    }
+    function closeGame(){ try{ $("#gameModal").classList.remove("open"); }catch(e){ console.warn(e);} }
+
+    // ---------- Leaderboards ----------
+    function addWinForLeaderboards(user, gameId, amount){
+      var wk=weekKey();
+      var root=db.doc("leaderboards/"+wk);
+      return root.get().then(function(s){ if(!s.exists){ return root.set({ createdAt: firebase.firestore.FieldValue.serverTimestamp() }); } }).then(function(){
+        var g1=db.doc("leaderboards/"+wk+"/global/"+user);
+        return g1.get().then(function(s){
+          if(s.exists){ return g1.update({ sum: firebase.firestore.FieldValue.increment(amount) }); }
+          return g1.set({ user:user, sum: amount });
+        }).then(function(){
+          var g2=db.doc("leaderboards/"+wk+"/"+gameId+"/"+user);
+          return g2.get().then(function(s){
+            if(s.exists){ return g2.update({ sum: firebase.firestore.FieldValue.increment(amount) }); }
+            return g2.set({ user:user, sum: amount });
+          });
+        });
+      });
+    }
+
+    function openToplist(){ if(!currentUser){ toast("Bitte zuerst anmelden."); return; } $("#weekKey").textContent=weekKey(); $("#toplistModal").classList.add("open"); loadToplists(); }
+    function closeToplist(){ try{ $("#toplistModal").classList.remove("open"); }catch(e){ console.warn(e);} }
+    function toggleTopTab(which){
+      if(which==="global"){ $("#tab-top-global").classList.add("active"); $("#tab-top-game").classList.remove("active"); $("#topGlobal").style.display="block"; $("#topGame").style.display="none"; }
+      else { $("#tab-top-game").classList.add("active"); $("#tab-top-global").classList.remove("active"); $("#topGlobal").style.display="none"; $("#topGame").style.display="block"; }
+    }
+    function loadToplists(){
+      var wk=weekKey();
+      db.collection("leaderboards").doc(wk).collection("global").orderBy("sum","desc").limit(25).get().then(function(s){
+        var wrap=$("#topGlobalList"); wrap.innerHTML=""; var i=0; s.forEach(function(d){ i++; var li=document.createElement("div"); li.className="row spread"; li.innerHTML="<strong>#"+i+" "+d.id+"</strong><span>"+fmt((d.data().sum)||0)+"</span>"; wrap.appendChild(li); });
+      });
+      var sel=$("#topGameSelect"); sel.innerHTML=""; games.forEach(function(g){ var o=document.createElement("option"); o.value=g.id; o.textContent=g.name; sel.appendChild(o); });
+      loadGameTop();
+    }
+    function loadGameTop(){
+      var wk=weekKey(); var gid=$("#topGameSelect").value;
+      db.collection("leaderboards").doc(wk).collection(gid).orderBy("sum","desc").limit(25).get().then(function(s){
+        var wrap=$("#topGameList"); wrap.innerHTML=""; var i=0; s.forEach(function(d){ i++; var li=document.createElement("div"); li.className="row spread"; li.innerHTML="<strong>#"+i+" "+d.id+"</strong><span>"+fmt((d.data().sum)||0)+"</span>"; wrap.appendChild(li); });
+      });
+    }
+    function openGameToplist(){
+      openToplist();
+      $("#tab-top-global").classList.remove("active");
+      $("#tab-top-game").classList.add("active");
+      $("#topGlobal").style.display="none";
+      $("#topGame").style.display="block";
+    }
+
+    // ---------- Chat ----------
+    function openChat(){ if(!currentUser){ toast("Bitte zuerst anmelden."); return; } $("#chatModal").classList.add("open"); setupChat(); }
+    function closeChat(){ try{ if(unsubGlobal){ unsubGlobal(); unsubGlobal=null; } if(unsubDM){ unsubDM(); unsubDM=null; } $("#chatModal").classList.remove("open"); }catch(e){ console.warn(e);} }
+    function showChatTab(which){
+      if(which==="global"){ $("#tab-global").classList.add("active"); $("#tab-private").classList.remove("active"); $("#globalChat").style.display="block"; $("#privateChat").style.display="none"; }
+      else { $("#tab-private").classList.add("active"); $("#tab-global").classList.remove("active"); $("#globalChat").style.display="none"; $("#privateChat").style.display="block"; }
+    }
+    function setupChat(){
+      if(unsubGlobal){ try{ unsubGlobal(); }catch(e){} }
+      unsubGlobal = db.collection("messages_global").orderBy("ts","desc").limit(50).onSnapshot(function(snap){
+        var list=$("#globalList"); list.innerHTML="";
+        snap.forEach(function(d){
+          var m=d.data(); var ts = m.ts && m.ts.toDate ? m.ts.toDate().toLocaleTimeString("de-DE") : "";
+          var row=document.createElement("div"); row.className="row";
+          row.innerHTML = "<strong>"+m.user+"</strong><span class=\"muted\" style=\"margin-left:.4rem\">"+ts+"</span><div class=\"right\">"+m.text+"</div>";
+          list.appendChild(row);
+        });
+      });
+      db.collection("users").get().then(function(s){
+        var sel=$("#dmTarget"); sel.innerHTML="";
+        s.forEach(function(u){ if(u.id!==currentUser.name){ var o=document.createElement("option"); o.value=u.id; o.textContent=u.id; sel.appendChild(o); } });
+        openDM();
+      });
+    }
+    function sendGlobal(){
+      var text=$("#globalInput").value.trim(); if(!text) return;
+      db.collection("messages_global").add({ user: currentUser.name, text: text, ts: firebase.firestore.FieldValue.serverTimestamp() }).then(function(){ $("#globalInput").value=""; });
+    }
+    function convId(a,b){ return [a,b].sort().join("__"); }
+    function openDM(){
+      if(unsubDM){ try{ unsubDM(); }catch(e){} }
+      var target=$("#dmTarget").value; if(!target){ $("#dmList").innerHTML=""; return; }
+      unsubDM = db.collection("dm").doc(convId(currentUser.name,target)).collection("messages").orderBy("ts","desc").limit(50).onSnapshot(function(snap){
+        var list=$("#dmList"); list.innerHTML="";
+        snap.forEach(function(d){
+          var m=d.data(); var ts = m.ts && m.ts.toDate ? m.ts.toDate().toLocaleTimeString("de-DE") : "";
+          var row=document.createElement("div"); row.className="row";
+          row.innerHTML = "<strong>"+m.user+"</strong><span class=\"muted\" style=\"margin-left:.4rem\">"+ts+"</span><div class=\"right\">"+m.text+"</div>";
+          list.appendChild(row);
+        });
+      });
+    }
+    function sendDM(){
+      var to=$("#dmTarget").value; var text=$("#dmInput").value.trim(); if(!to || !text) return;
+      db.collection("dm").doc(convId(currentUser.name,to)).collection("messages").add({ user: currentUser.name, text: text, ts: firebase.firestore.FieldValue.serverTimestamp() }).then(function(){ $("#dmInput").value=""; });
+    }
+
+    // ---------- Admin ----------
+    document.addEventListener("keydown", function(e){
+      if(e.ctrlKey && e.altKey && (e.key==="#" || e.key==="3" || e.code==="Digit3")){
+        var pw = prompt("Admin-Passwort eingeben:");
+        if(pw==="140318"){ adminMode=true; openAdmin(); } else { toast("Falsches Admin-Passwort."); }
+      }
+    });
+    function openAdmin(){ if(!adminMode){ return; } $("#adminModal").classList.add("open"); refreshAdmin(); }
+    function closeAdmin(){ try{ $("#adminModal").classList.remove("open"); }catch(e){ console.warn(e);} }
+    function refreshAdmin(){
+      db.collection("users").get().then(function(s){
+        var box=$("#adminUsers"); box.innerHTML="";
+        s.forEach(function(u){
+          var d=u.data(); var row=document.createElement("div"); row.className="row spread";
+          row.innerHTML = "<strong>"+u.id+"</strong><span>Wallet "+fmt(d.balance||0)+" · Loan "+fmt(d.loan?d.loan.outstanding:0)+"</span>";
+          box.appendChild(row);
+        });
+      });
+    }
+    function adminBank(action){
+      if(!adminMode) return;
+      var amt = Number($("#adminBankAmt").value||0);
+      db.doc("system/bank").get().then(function(s){
+        var b=(s.exists && s.data().balance)||0;
+        if(action==="add") b+=amt; if(action==="sub") b-=amt; if(action==="reset") b=1000000000;
+        return db.doc("system/bank").update({ balance:b }).then(function(){
+          var t = action==="sub" ? "admin-out" : (action==="add"?"admin-in":"admin-reset");
+          return bankLedger(action==="sub"? -amt : amt, t, {by: currentUser?currentUser.name:"admin"});
+        }).then(function(){ toast("Bank aktualisiert."); refreshBankPanel(); });
+      });
+    }
+    function adminUser(action){
+      if(!adminMode) return;
+      var name=$("#adminUserName").value.trim(); var amt=Number($("#adminUserAmt").value||0);
+      if(!name || amt<=0){ toast("Nutzer & Betrag erforderlich."); return; }
+      var ref=db.doc("users/"+name);
+      ref.get().then(function(us){
+        if(!us.exists){ toast("Nutzer nicht gefunden."); return; }
+        var u=us.data();
+        if(action==="give"){
+          return ref.update({ balance:(u.balance||0)+amt }).then(function(){
+            return db.doc("system/bank").get().then(function(bs){ var bb=(bs.exists&&bs.data().balance)||0; return db.doc("system/bank").update({ balance: bb-amt }).then(function(){ return bankLedger(-amt,"payout-out",{admin: currentUser?currentUser.name:"admin", to:name}); }); });
+          });
+        }else{
+          if((u.balance||0)<amt){ toast("Zu wenig beim Nutzer."); return; }
+          return ref.update({ balance:(u.balance||0)-amt }).then(function(){
+            return db.doc("system/bank").get().then(function(bs){ var bb=(bs.exists&&bs.data().balance)||0; return db.doc("system/bank").update({ balance: bb+amt }).then(function(){ return bankLedger(+amt,"bet-in",{admin: currentUser?currentUser.name:"admin", from:name}); }); });
+          });
+        }
+      }).then(function(){ toast("Nutzer aktualisiert."); refreshAdmin(); refreshBankPanel(); }).catch(function(err){ if(err) console.warn(err); });
+    }
+
+  </script>
+</body>
+</html>
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Schnipels-Casino · LIVE</title>
+  <meta name="theme-color" content="#0b0b14"/>
+  <style>
+    :root{
+      --bg:#0b0b14;--bg2:#131327;--fg:#e8ecff;--muted:#a7b0d6;--accent:#8ab4ff;--accent2:#d78bff;--gold:#ffd54d;
+      --card:#14142a;--card2:#191939;--border:#2a2a54;--good:#8cffb1;--bad:#ff8aa6;
+    }
+    *{box-sizing:border-box}
+    html,body{margin:0;padding:0;background:radial-gradient(1200px 1200px at 80% -10%, rgba(215,139,255,.25),transparent 60%),
+                         radial-gradient(1200px 900px at -20% 110%, rgba(138,180,255,.22),transparent 60%),
+                         linear-gradient(180deg,#0b0b14 0%, #0f0f20 60%, #0b0b14 100%);
+              color:var(--fg);font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;min-height:100%}
+    header{position:sticky;top:0;z-index:50;background:linear-gradient(90deg,rgba(138,180,255,.12),rgba(215,139,255,.12) 50%,rgba(138,180,255,.12) 100%);backdrop-filter:blur(8px);border-bottom:1px solid var(--border)}
+    .header-inner{display:flex;align-items:center;gap:.75rem;padding:.75rem .9rem}
+    .app-title{font-weight:800;letter-spacing:.4px;background:linear-gradient(120deg,#e8ecff,#8ab4ff,#d78bff,#ffd54d,#e8ecff);
+      background-size:300% 300%;-webkit-background-clip:text;background-clip:text;color:transparent;animation:shimmer 8s ease-in-out infinite;
+      font-size:1.05rem;flex:1;text-shadow:0 0 18px rgba(140,180,255,.15)}
+    @keyframes shimmer{0%{background-position:0% 50%}50%{background-position:100% 50%}100%{background-position:0% 50%}}
+    .icon-btn{appearance:none;border:none;background:transparent;color:var(--fg);padding:.5rem;border-radius:12px;display:inline-flex;align-items:center;justify-content:center;font-size:1.25rem;position:relative}
+    .icon-btn:active{transform:scale(.96)}
+    .status{font-size:.7rem;color:var(--muted);border:1px solid var(--border);padding:.2rem .45rem;border-radius:999px}
+    .tabs{display:flex;gap:.4rem;padding:.6rem .9rem;background:rgba(20,20,42,.5);border-bottom:1px solid var(--border)}
+    .tab{flex:1;text-align:center;padding:.55rem;border-radius:12px;border:1px solid var(--border);background:var(--card);color:var(--muted);font-weight:600;cursor:pointer}
+    .tab.active{background:linear-gradient(180deg,rgba(138,180,255,.15),rgba(25,25,57,.65));color:var(--fg);border-color:#3a3a7a}
+    main{padding:1rem;max-width:980px;margin:0 auto}
+    .grid{display:grid;grid-template-columns:repeat(2,1fr);gap:.7rem}
+    @media(min-width:480px){.grid{grid-template-columns:repeat(3,1fr)}}
+    .card{background:linear-gradient(180deg, rgba(25,25,57,.8), rgba(20,20,42,.8));border:1px solid var(--border);border-radius:16px;padding:.8rem;display:flex;flex-direction:column;gap:.4rem}
+    .card h4{margin:.2rem 0;font-size:.95rem}
+    .muted{color:var(--muted);font-size:.8rem}
+    .pill{display:inline-block;padding:.23rem .5rem;border-radius:999px;border:1px solid var(--border);font-size:.7rem;color:var(--muted)}
+    .btn{appearance:none;border:none;border-radius:12px;padding:.7rem .9rem;font-weight:700;background:linear-gradient(180deg,#2c2c64,#1a1a3a);color:#e8ecff;border:1px solid #3a3a7a;cursor:pointer}
+    .btn:active{transform:translateY(1px)}
+    .btn.primary{background:linear-gradient(180deg,#6d8cff,#4c6bff);border-color:#6d8cff;color:#0b0b14}
+    .btn.good{background:linear-gradient(180deg,#8cffb1,#62e39a);border-color:#62e39a;color:#0a120d}
+    .btn.bad{background:linear-gradient(180deg,#ff8aa6,#ff557a);border-color:#ff718f;color:#140b0d}
+    .row{display:flex;gap:.6rem;align-items:center}
+    .row.spread{justify-content:space-between}
+    .field{display:flex;flex-direction:column;gap:.3rem}
+    input,select{width:100%;padding:.7rem .8rem;border-radius:12px;border:1px solid var(--border);background:var(--card);color:var(--fg)}
+    .footer{height:64px}
+    .modal{position:fixed;inset:0;display:none;align-items:end;justify-content:center;background:rgba(0,0,0,.45);z-index:100}
+    .modal.open{display:flex}
+    .sheet{width:100%;max-width:980px;background:linear-gradient(180deg,rgba(25,25,57,.97),rgba(12,12,24,.97));
+      border-top:1px solid var(--border);border-left:1px solid var(--border);border-right:1px solid var(--border);
+      border-top-left-radius:18px;border-top-right-radius:18px;max-height:85vh;overflow:auto;padding:1rem}
+    .sheet h3{margin:.4rem 0 1rem 0}
+    .list{display:flex;flex-direction:column;gap:.5rem}
+    .list .row{background:var(--card2);padding:.6rem;border-radius:12px;border:1px solid var(--border)}
+    .toast{position:fixed;left:50%;transform:translateX(-50%);bottom:76px;background:#1b1b35;color:#fff;border:1px solid #3a3a7a;padding:.7rem 1rem;border-radius:12px;display:none;z-index:200}
+    .toast.show{display:block}
+    .auth{max-width:560px;margin:1.2rem auto;padding:1rem;background:linear-gradient(180deg,rgba(25,25,57,.8),rgba(12,12,24,.8));border:1px solid var(--border);border-radius:16px}
+    .hr{height:1px;background:var(--border);margin:.8rem 0}
+    canvas{max-width:100%}
+  </style>
+</head>
+<body>
+  <header>
+    <div class="header-inner">
+      <div class="app-title">Schnipels-Casino · LIVE</div>
+      <span id="status" class="status">Status: Lädt…</span>
+      <button class="icon-btn" title="Top-List" aria-label="Top-List" onclick="openToplist()">🏆</button>
+      <button class="icon-btn" title="Bank" aria-label="Bank" onclick="openBank()">🏦</button>
+      <button class="icon-btn" title="Chat" aria-label="Chat" onclick="openChat()">💬</button>
+    </div>
+    <div class="tabs" id="userBar" style="display:none">
+      <div class="tab active" id="tab-games" onclick="showTab('games')">🎰 Spiele</div>
+      <div class="tab" id="tab-profile" onclick="showTab('profile')">👤 Profil</div>
+      <div class="tab" id="tab-spin" onclick="openDailySpin();showTab('spin')">🎡 Tagesrad</div>
+    </div>
+  </header>
+
+  <div id="auth" class="auth">
+    <h2 style="margin-top:0">Konto erstellen / anmelden</h2>
+    <p class="muted">Nur Benutzername, Geburtsdatum, Passwort. E-Mail wird **automatisch** erzeugt.</p>
+    <div class="row">
+      <div class="field" style="flex:1">
+        <label>Benutzername</label>
+        <input id="nameInput" placeholder="z.B. Julian1337" maxlength="20"/>
+      </div>
+      <div class="field" style="width:140px">
+        <label>Geburtsdatum</label>
+        <input id="dobInput" type="date"/>
+      </div>
+    </div>
+    <div class="row">
+      <div class="field" style="flex:1">
+        <label>Passwort</label>
+        <input id="passInput" type="password" placeholder="mind. 6 Zeichen" maxlength="32"/>
+      </div>
+    </div>
+    <div class="row spread" style="margin-top:.6rem">
+      <button class="btn primary" onclick="register()">Registrieren</button>
+      <button class="btn" onclick="login()">Anmelden</button>
+    </div>
+    <div class="hr"></div>
+    <p class="muted" id="backendInfo"></p>
+  </div>
+
+  <main id="app" style="display:none">
+    <section id="gamesView">
+      <div class="grid" id="gamesGrid"></div>
+    </section>
+    <section id="profileView" style="display:none">
+      <div class="card">
+        <h4>Dein Konto</h4>
+        <div class="row spread"><span class="muted">Benutzer</span><strong id="profName">–</strong></div>
+        <div class="row spread"><span class="muted">Wallet</span><strong id="profBalance">0 €</strong></div>
+        <div class="row spread"><span class="muted">Leihen offen</span><strong id="profLoan">0 €</strong></div>
+      </div>
+      <div class="card" style="margin-top:.6rem">
+        <h4>Bank-Konten</h4>
+        <div class="row spread"><span>NOVALINE</span><span id="balNovaline">–</span></div>
+        <div class="row spread"><span>STARLINE</span><span id="balStarline">–</span></div>
+        <div class="row" style="margin-top:.6rem">
+          <button class="btn" onclick="openBank()">🏦 Bank öffnen</button>
+        </div>
+      </div>
+      <div class="card" style="margin-top:.6rem">
+        <h4>Tagesrad (1× täglich)</h4>
+        <p class="muted">Gewinne: 10 · 30 · 50 · 100 · 1.000 € — plus 4× Niete</p>
+        <button class="btn good" onclick="openDailySpin();showTab('spin')">🎡 Jetzt drehen</button>
+      </div>
+    </section>
+    <section id="spinView" style="display:none">
+      <div class="card">
+        <h4>Tagesrad</h4>
+        <canvas id="spinCanvas" width="340" height="340" style="margin:0 auto;display:block"></canvas>
+        <div class="row spread" style="margin-top:.6rem">
+          <button class="btn" onclick="spinDaily()">Drehen</button>
+          <div class="pill" id="spinStatus">Bereit</div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- Game Modal -->
+  <div class="modal" id="gameModal" aria-hidden="true">
+    <div class="sheet">
+      <div class="row spread">
+        <h3 id="gameTitle">Spiel</h3>
+        <button class="icon-btn" onclick="closeGame()">✖</button>
+      </div>
+      <div id="gameUI"></div>
+      <div class="hr"></div>
+      <div class="row spread">
+        <div><span class="muted">Wallet:</span> <strong id="walletInline">0 €</strong></div>
+        <button class="btn" onclick="openGameToplist()">🏆 Top-List</button>
+      </div>
+      <div class="list" id="gameLog" style="margin-top:.6rem"></div>
+    </div>
+  </div>
+
+  <!-- Bank Modal -->
+  <div class="modal" id="bankModal" aria-hidden="true">
+    <div class="sheet">
+      <div class="row spread">
+        <h3>Bank · Verbunden mit allen Casinos</h3>
+        <button class="icon-btn" onclick="closeBank()">✖</button>
+      </div>
+      <div class="grid" style="grid-template-columns:1fr 1fr;gap:.6rem">
+        <div class="card">
+          <h4>Bank-Status</h4>
+          <div class="row spread"><span>Kontostand Bank</span><strong id="bankBalance">–</strong></div>
+          <div class="row spread"><span>Einnahmen (Σ)</span><strong id="bankIn">–</strong></div>
+          <div class="row spread"><span>Auszahlungen (Σ)</span><strong id="bankOut">–</strong></div>
+        </div>
+        <div class="card">
+          <h4>Leihen</h4>
+          <div class="row"><input id="loanAmount" type="number" min="0" step="100" placeholder="Betrag (max 10.000/Tag)"/></div>
+          <div class="row" style="gap:.4rem">
+            <button class="btn" onclick="borrow()">💸 Leihen</button>
+            <button class="btn good" onclick="repay()">✅ Zurückzahlen (10% Zins)</button>
+          </div>
+          <div class="muted" id="loanInfo" style="font-size:.8rem;margin-top:.3rem"></div>
+        </div>
+      </div>
+      <div class="card" style="margin-top:.6rem">
+        <h4>Bank-Konten & Transaktionen</h4>
+        <div class="row" style="gap:.4rem;flex-wrap:wrap">
+          <span class="pill">NOVALINE: täglich +500 € · Überziehung −100.000 €</span>
+          <span class="pill">STARLINE: Abheben ≤ 15.000/Tag · Überziehung −200.000 €</span>
+        </div>
+        <div class="row" style="margin-top:.6rem">
+          <select id="accountSelect">
+            <option value="novaline">NOVALINE</option>
+            <option value="starline">STARLINE</option>
+          </select>
+          <input id="txnAmount" type="number" min="0" step="50" placeholder="Betrag"/>
+        </div>
+        <div class="row" style="gap:.4rem;margin-top:.4rem">
+          <button class="btn" onclick="deposit()">↗ Einzahlen</button>
+          <button class="btn" onclick="withdraw()">↙ Abheben</button>
+          <button class="btn good" onclick="claimDaily()">🎁 Daily (NOVA)</button>
+        </div>
+        <div class="hr"></div>
+        <canvas id="bankChart" height="200"></canvas>
+      </div>
+    </div>
+  </div>
+
+  <!-- Chat Modal -->
+  <div class="modal" id="chatModal" aria-hidden="true">
+    <div class="sheet">
+      <div class="row spread">
+        <h3>Chat</h3>
+        <button class="icon-btn" onclick="closeChat()">✖</button>
+      </div>
+      <div class="tabs">
+        <div class="tab active" id="tab-global" onclick="showChatTab('global')">🌐 Global</div>
+        <div class="tab" id="tab-private" onclick="showChatTab('private')">🔒 Privat</div>
+      </div>
+      <div id="globalChat">
+        <div class="list" id="globalList" style="min-height:200px"></div>
+        <div class="row" style="margin-top:.6rem">
+          <input id="globalInput" placeholder="Nachricht an alle..."/>
+          <button class="btn" onclick="sendGlobal()">Senden</button>
+        </div>
+      </div>
+      <div id="privateChat" style="display:none">
+        <div class="row" style="gap:.4rem">
+          <select id="dmTarget"></select>
+          <input id="dmInput" placeholder="Private Nachricht..."/>
+          <button class="btn" onclick="sendDM()">Senden</button>
+        </div>
+        <div class="list" id="dmList" style="margin-top:.6rem;min-height:200px"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toplist Modal -->
+  <div class="modal" id="toplistModal" aria-hidden="true">
+    <div class="sheet">
+      <div class="row spread">
+        <h3>Top-List · Woche <span id="weekKey">—</span></h3>
+        <button class="icon-btn" onclick="closeToplist()">✖</button>
+      </div>
+      <div class="tabs">
+        <div class="tab active" id="tab-top-global" onclick="toggleTopTab('global')">🌐 Gesamt</div>
+        <div class="tab" id="tab-top-game" onclick="toggleTopTab('game')">🎮 Pro Spiel</div>
+      </div>
+      <div id="topGlobal">
+        <div class="list" id="topGlobalList"></div>
+      </div>
+      <div id="topGame" style="display:none">
+        <select id="topGameSelect" style="margin:.6rem 0" onchange="loadGameTop()"></select>
+        <div class="list" id="topGameList"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Admin Modal -->
+  <div class="modal" id="adminModal" aria-hidden="true">
+    <div class="sheet">
+      <div class="row spread">
+        <h3>Admin · Bank & Nutzer</h3>
+        <button class="icon-btn" onclick="closeAdmin()">✖</button>
+      </div>
+      <div class="grid" style="grid-template-columns:1fr 1fr;gap:.6rem">
+        <div class="card">
+          <h4>Bank steuern</h4>
+          <div class="row"><input id="adminBankAmt" type="number" step="1000" placeholder="Betrag"/></div>
+          <div class="row" style="gap:.4rem">
+            <button class="btn" onclick="adminBank('add')">+ Bank auffüllen</button>
+            <button class="btn bad" onclick="adminBank('sub')">− Bank entnehmen</button>
+          </div>
+          <div class="row" style="gap:.4rem;margin-top:.4rem">
+            <button class="btn good" onclick="adminBank('reset')">⟳ Reset auf 1.000.000.000 €</button>
+          </div>
+        </div>
+        <div class="card">
+          <h4>Nutzer steuern</h4>
+          <div class="row"><input id="adminUserName" placeholder="Benutzername"/></div>
+          <div class="row"><input id="adminUserAmt" type="number" step="100" placeholder="Betrag"/></div>
+          <div class="row" style="gap:.4rem">
+            <button class="btn" onclick="adminUser('give')">+ Geld geben</button>
+            <button class="btn bad" onclick="adminUser('take')">− Geld abziehen</button>
+          </div>
+        </div>
+      </div>
+      <div class="card" style="margin-top:.6rem">
+        <h4>Alle Nutzer</h4>
+        <div class="list" id="adminUsers"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+  <div class="footer"></div>
+
+  <!-- Firebase v8 (Auth + Firestore) & Chart.js -->
+  <script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-app.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-auth.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-firestore.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+
+  <script>
+    // ---------- Helpers ----------
+    function $(s){ return document.querySelector(s); }
+    function $all(s){ return Array.prototype.slice.call(document.querySelectorAll(s)); }
+    function toast(msg, ms){ ms = ms || 2200; var t=$("#toast"); t.textContent=msg; t.classList.add("show"); setTimeout(function(){ t.classList.remove("show"); }, ms); }
+    function fmt(n){ return new Intl.NumberFormat("de-DE",{style:"currency",currency:"EUR"}).format(n||0); }
+    function todayKey(){ return new Date().toISOString().slice(0,10); }
+    function weekKey(){ var d=new Date(); var onejan=new Date(d.getFullYear(),0,1); var diff=d-onejan; var day=Math.floor(diff/86400000)+onejan.getDay()+1; var w=Math.ceil(day/7); return d.getFullYear()+"-W"+String(w).padStart(2,'0'); }
+    function sleep(ms){ return new Promise(function(r){ setTimeout(r,ms); }); }
+    function sha(s){
+      return crypto.subtle.digest("SHA-256", new TextEncoder().encode(s)).then(function(buf){
+        return Array.prototype.map.call(new Uint8Array(buf), function(b){ return b.toString(16).padStart(2,"0"); }).join("");
+      });
+    }
+    function emailFromName(name){
+      var slug = name.toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,'');
+      return slug + '@noemail.schnipels.app';
+    }
+    window.addEventListener("error", function(e){ try{ toast("Fehler: "+(e.message||"Script")); }catch(_){} console.error(e); });
+
+    // ---------- Firebase (LIVE) ----------
+    var firebaseConfig = {
+      apiKey: "AIzaSyDN1MZv_q38Zoymt92BHWTe9sUNwteT1KA",
+      authDomain: "sample-firebase-ai-app-b02a4.firebaseapp.com",
+      projectId: "sample-firebase-ai-app-b02a4",
+      storageBucket: "sample-firebase-ai-app-b02a4.firebasestorage.app",
+      messagingSenderId: "382050648468",
+      appId: "1:382050648468:web:8c6f34051a7b2991ebcf81"
+    };
+    firebase.initializeApp(firebaseConfig);
+    var db = firebase.firestore();
+    var auth = firebase.auth();
+    $("#status").textContent = "Status: Online (LIVE · Auth + Firestore)";
+    $("#backendInfo").textContent = "Live-Sync aktiv mit Firebase Authentication (E-Mail wird intern generiert).";
+
+    // Ensure bank doc exists after first auth
+    auth.onAuthStateChanged(function(u){
+      if(u){
+        db.doc("system/bank").get().then(function(s){
+          if(!s.exists){ return db.doc("system/bank").set({ balance: 1000000000, createdAt: firebase.firestore.FieldValue.serverTimestamp() }); }
+        });
+      }
+    });
+
+    // ---------- State ----------
+    var currentUser = null; // Firestore user doc (not auth)
+    var authUser = null;    // firebase.auth().currentUser
+    var adminMode = false;
+    var bankChart = null;
+    var unsubGlobal = null, unsubDM = null;
+
+    // ---------- UI ----------
+    function showApp(){ $("#auth").style.display="none"; $("#app").style.display="block"; $("#userBar").style.display="flex"; }
+    function showTab(key){
+      $all(".tabs .tab").forEach(function(t){ t.classList.remove("active"); });
+      if(key==="games"){ $("#tab-games").classList.add("active"); $("#gamesView").style.display="block"; $("#profileView").style.display="none"; $("#spinView").style.display="none"; }
+      if(key==="profile"){ $("#tab-profile").classList.add("active"); $("#gamesView").style.display="none"; $("#profileView").style.display="block"; $("#spinView").style.display="none"; }
+      if(key==="spin"){ $("#tab-spin").classList.add("active"); $("#gamesView").style.display="none"; $("#profileView").style.display="none"; $("#spinView").style.display="block"; }
+    }
+
+    // ---------- Games ----------
+    var games = [
+      {id:"triple-chunks", name:"Triple Chunks", desc:"Klassischer 3-Walzen-Slot", min:10, max:5000, type:"slot3"},
+      {id:"lucky-pharaoh", name:"Lucky Pharaoh", desc:"5-Walzen-Slot mit Multiplikator", min:10, max:5000, type:"slot5"},
+      {id:"isle-of-horrors", name:"Isle of Horrors", desc:"Bonus-Rad Abenteuer", min:10, max:2000, type:"wheel"},
+      {id:"hilo", name:"Hi-Lo", desc:"Höher / Niedriger", min:10, max:10000, type:"hilo"},
+      {id:"dice-duel", name:"Dice Duel", desc:"Zwei Würfel > 7 gewinnt", min:10, max:10000, type:"dice"},
+      {id:"roulette", name:"Roulette", desc:"Rot / Schwarz", min:10, max:10000, type:"roulette"},
+      {id:"blackjack", name:"Blackjack", desc:"Bis 21 gegen Dealer", min:10, max:5000, type:"blackjack"},
+      {id:"coinflip", name:"Coin Flip", desc:"Kopf oder Zahl x2", min:10, max:10000, type:"coin"},
+      {id:"plinko", name:"Plinko", desc:"Falle durch Multiplikatoren", min:10, max:3000, type:"plinko"},
+      {id:"scratch", name:"Scratch", desc:"3-Gleiche Rubbelkarte", min:10, max:2000, type:"scratch"}
+    ];
+    function renderGames(){
+      var grid=$("#gamesGrid"); grid.innerHTML="";
+      games.forEach(function(g){
+        var el=document.createElement("div"); el.className="card";
+        el.innerHTML = '<span class="pill">Min '+fmt(g.min)+'</span><h4>'+g.name+'</h4><div class="muted">'+g.desc+'</div><button class="btn">Spielen</button>';
+        el.querySelector("button").onclick=function(){ openGame(g.id); };
+        grid.appendChild(el);
+      });
+    }
+
+    // ---------- Auth (email = name@noemail.schnipels.app) ----------
     function register(){
       var name=$("#nameInput").value.trim();
       var dob=$("#dobInput").value;
